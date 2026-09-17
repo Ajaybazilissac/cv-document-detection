@@ -1,4 +1,8 @@
 import os
+# Disable oneDNN / MKLDNN PIR kernel translation bugs on Windows CPU
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_pir_api"] = "0"
+
 import cv2
 import numpy as np
 from paddleocr import PaddleOCR
@@ -11,18 +15,22 @@ class VisionService:
 
     @classmethod
     def get_ocr_engine(cls):
-        """Lazy-load PaddleOCR singleton only when requested."""
+        """Lazy-load PaddleOCR engine using stable CPU parameters."""
         if cls._ocr_engine is None:
             print("[PaddleOCR] Initializing deep learning models...")
-            cls._ocr_engine = PaddleOCR(use_angle_cls=True, lang='en')
+            # enable_mkldnn=False avoids the unimplemented oneDNN PIR attribute crash
+            cls._ocr_engine = PaddleOCR(
+                lang='en',
+                use_angle_cls=False,
+                enable_mkldnn=False
+            )
             print("[PaddleOCR] Engine ready.")
         return cls._ocr_engine
 
     @classmethod
     def extract_text_with_paddle(cls, image: np.ndarray) -> str:
         """
-        Runs deep-learning OCR using PaddleOCR on cropped document image.
-        Supports both modern PaddleOCR/PaddleX pipeline structures and legacy list structures.
+        Runs PaddleOCR and parses results safely across all response formats.
         """
         try:
             engine = cls.get_ocr_engine()
@@ -33,7 +41,7 @@ class VisionService:
 
             extracted_lines = []
 
-            # Format 1: Modern PaddleOCR/PaddleX pipeline result (list of dicts/Result objects)
+            # Case 1: PaddleX v3 Pipeline result (list of objects/dicts)
             if isinstance(result, list) and len(result) > 0 and (isinstance(result[0], dict) or hasattr(result[0], "keys")):
                 for item in result:
                     rec_texts = (
@@ -53,17 +61,19 @@ class VisionService:
                     elif isinstance(rec_texts, str) and rec_texts.strip():
                         extracted_lines.append(rec_texts.strip())
 
-            # Format 2: Standard/Legacy format [[[box, (text, score)], ...]]
+            # Case 2: Standard/Legacy format [[[box, (text, score)], ...]]
             elif isinstance(result, list) and len(result) > 0 and result[0] is not None:
-                for line in result[0]:
-                    if isinstance(line, (list, tuple)) and len(line) >= 2:
-                        val = line[1]
-                        if isinstance(val, (list, tuple)) and len(val) >= 1:
-                            extracted_lines.append(str(val[0]).strip())
-                        elif isinstance(val, str):
-                            extracted_lines.append(val.strip())
-                    elif isinstance(line, str):
-                        extracted_lines.append(line.strip())
+                first_elem = result[0]
+                if isinstance(first_elem, list):
+                    for line in first_elem:
+                        if isinstance(line, (list, tuple)) and len(line) >= 2:
+                            val = line[1]
+                            if isinstance(val, (list, tuple)) and len(val) >= 1:
+                                extracted_lines.append(str(val[0]).strip())
+                            elif isinstance(val, str):
+                                extracted_lines.append(val.strip())
+                        elif isinstance(line, str):
+                            extracted_lines.append(line.strip())
 
             return "\n".join(extracted_lines).strip()
 
@@ -73,7 +83,6 @@ class VisionService:
 
     @classmethod
     def process_document(cls, image_bytes: bytes) -> ScanResponse:
-        # 1. Decode raw bytes to OpenCV BGR numpy array
         img_bgr = bytes_to_cv2_image(image_bytes)
         h, w, c = img_bgr.shape
 
@@ -86,18 +95,14 @@ class VisionService:
             max_intensity=int(img_bgr.max())
         )
 
-        # 2. Color Conversion: BGR -> Grayscale
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-        # 3. Histogram Analysis (8 downsampled buckets for frontend chart)
         hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
         bins = [0, 32, 64, 96, 128, 160, 192, 224]
         frequencies = [int(np.sum(hist[i:i + 32])) for i in bins]
         histogram_data = HistogramData(bins=bins, frequencies=frequencies)
 
-        # =========================================================================
-        # 4. Standardized scale for edge & contour analysis (800px target)
-        # =========================================================================
+        # Standardized working scale
         TARGET_H = 800.0
         scale = TARGET_H / float(h)
         target_w = int(w * scale)
@@ -119,7 +124,6 @@ class VisionService:
         small_total_area = target_w * TARGET_H
         best_box = None
 
-        # Tier 1: Quadrilateral search (5% - 98% image area)
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if 0.05 * small_total_area < area < 0.98 * small_total_area:
@@ -129,7 +133,6 @@ class VisionService:
                     best_box = cv2.boundingRect(cnt)
                     break
 
-        # Tier 2: Largest contour fallback
         if best_box is None and contours:
             for cnt in contours:
                 area = cv2.contourArea(cnt)
@@ -137,7 +140,6 @@ class VisionService:
                     best_box = cv2.boundingRect(cnt)
                     break
 
-        # Tier 3: Threshold background contrast fallback
         if best_box is None:
             _, thresh_fallback = cv2.threshold(
                 blurred_small, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
@@ -148,9 +150,6 @@ class VisionService:
                 if cv2.contourArea(largest_fb) > 0.05 * small_total_area:
                     best_box = cv2.boundingRect(largest_fb)
 
-        # =========================================================================
-        # 5. Scale coordinates back to original image
-        # =========================================================================
         if best_box is not None:
             sx, sy, sw, sh = best_box
             orig_scale = 1.0 / scale
@@ -169,9 +168,7 @@ class VisionService:
         crop_w = min(crop_w, w - crop_x)
         crop_h = min(crop_h, h - crop_y)
 
-        # =========================================================================
-        # 6. Draw dynamic thickness green bounding box
-        # =========================================================================
+        # Draw dynamic green bounding box
         img_bbox = img_bgr.copy()
         box_thickness = max(int(min(h, w) / 120), 8)
         cv2.rectangle(
@@ -182,9 +179,6 @@ class VisionService:
             box_thickness
         )
 
-        # =========================================================================
-        # 7. Crop ROI and compute adaptive Gaussian thresholding
-        # =========================================================================
         cropped_color = img_bgr[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
         if cropped_color.size == 0:
             cropped_color = img_bgr
@@ -200,11 +194,8 @@ class VisionService:
             11
         )
 
-        # =========================================================================
-        # 8. Run PaddleOCR
-        # =========================================================================
+        # OCR extraction directly on cropped ROI
         ocr_text = cls.extract_text_with_paddle(cropped_color)
-
         if not ocr_text:
             ocr_text = cls.extract_text_with_paddle(final_binary)
 
